@@ -18,6 +18,10 @@ Apps open
   ChatGPT
   Claude
   Cursor
+─────────────────────────────
+✓ Notify when a session finishes
+  Send test notification
+  Quit
 ```
 
 The title shows `working/total` when something is running, otherwise just the session count.
@@ -62,7 +66,9 @@ present themselves the obvious way:
 
 A live process is not a busy one. Activity is measured two ways:
 
-- **Processes:** CPU time consumed between two scans. An agent waiting for you burns none.
+- **Processes:** CPU time consumed between two scans, summed across the whole process
+  subtree. An agent waiting for you burns none, but an agent that shelled out to a build
+  also burns none while its child does the work, which would otherwise read as idle.
 - **Codex threads:** the last event in the transcript. A finished turn ends with
   `task_complete`; anything else means it is mid-turn.
 
@@ -78,6 +84,30 @@ Terminal and iTerm2 an AppleScript then selects the specific tab matching the se
 Tab selection needs Automation permission, requested once on first click. If it is denied,
 the terminal still comes to the front, just not the specific tab. Sessions with no parent
 terminal, like `cursor-agent`, fall back to activating Cursor.
+
+Codex threads have no terminal, and activating ChatGPT is not enough when several
+conversations are open. They open through `codex://threads/<id>`, the URL scheme ChatGPT
+registers and uses for its own "copy link" feature. For a top-level thread the id is the
+`session_id` in its rollout transcript, which is what sessions are already grouped by.
+
+## Notifications
+
+When a session that was working goes quiet, it sends a notification so you can go check on
+it. Quiet means several consecutive scans with no CPU, not a single one, so a pause between
+turns does not fire it. Toggle it from the menu; "Send test notification" checks delivery.
+
+Delivery has a wrinkle. `UserNotifications` is preferred because a notification can then be
+clicked to focus the session that sent it, but it needs a permission macOS refuses to grant
+an ad-hoc signed app: without a signing certificate the app has no stable identity, so
+`requestAuthorization` fails with "Notifications are not allowed for this application".
+The fallback posts the same banner through AppleScript, which needs no permission but
+cannot carry a click action.
+
+If you have an Apple Developer certificate, signing with it in `build.sh` instead of `-`
+enables the native path and click-to-focus.
+
+Regardless of which path is used, the menu bar icon turns into 🔔 when a session finishes,
+and clears when you open the menu. That signal cannot be blocked by permissions.
 
 ## Cost
 

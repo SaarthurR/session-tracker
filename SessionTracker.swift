@@ -1,5 +1,6 @@
 import Cocoa
 import Darwin
+import UserNotifications
 
 // MARK: - Configuration
 
@@ -32,6 +33,9 @@ let cursorBundleID = "com.todesktop.230313mzl4w4u92"
 let refreshInterval: TimeInterval = 5.0
 /// CPU seconds burned between two scans before a session counts as working.
 let workingCPUThreshold: Double = 0.05
+/// Consecutive quiet scans before a session that was working is called finished. Guards
+/// against notifying during a pause between turns.
+let idleConfirmScans = 3
 /// A Codex thread has no process of its own, so it is listed while its transcript is this fresh.
 let codexSessionWindow: TimeInterval = 30 * 60
 /// Re-reading the tail of a transcript is only worth it while it is still changing.
@@ -45,10 +49,26 @@ let recentlyActiveWindow: TimeInterval = 15 * 60
 enum HostTarget {
     case app(pid: pid_t, tty: String?)
     case bundle(String)
+    /// ChatGPT can open a specific conversation, which is the only way to tell two apart.
+    case codexThread(String)
     case unknown
+
+    var describedHost: String {
+        switch self {
+        case .app(let pid, let tty):
+            let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
+            return tty.map { "\(name) · \($0)" } ?? name
+        case .bundle(let bundleID):
+            return NSWorkspace.shared.runningApplications
+                .first { $0.bundleIdentifier == bundleID }?.localizedName ?? bundleID
+        case .codexThread: return "ChatGPT"
+        case .unknown: return ""
+        }
+    }
 }
 
 struct Session {
+    let key: String
     let agent: String
     let folder: String
     let path: String?
@@ -77,8 +97,18 @@ struct DesktopApp {
 }
 
 struct Snapshot {
+    var id = 0
     var sessions: [Session] = []
     var apps: [DesktopApp] = []
+    /// Sessions that finished working since the previous scan.
+    var wentIdle: [Session] = []
+}
+
+/// Per-session history, kept between scans so a pause is not mistaken for finishing.
+struct TrackState {
+    var wasWorking = false
+    var quietScans = 0
+    var notified = false
 }
 
 // MARK: - Helpers
@@ -252,6 +282,20 @@ final class ProcessTable {
         taskInfo(pid).map { Double($0.ptinfo.pti_total_user + $0.ptinfo.pti_total_system) / 1e9 }
     }
 
+    /// An agent shelling out to a build sits at zero CPU while its child does the work,
+    /// so activity has to be measured across the whole subtree.
+    func subtreeCPUSeconds(_ pid: pid_t, children: [pid_t: [pid_t]], limit: Int = 200) -> Double? {
+        var total = cpuSeconds(pid)
+        var queue = children[pid] ?? []
+        var visited = 0
+        while let next = queue.popLast(), visited < limit {
+            visited += 1
+            if let cpu = cpuSeconds(next) { total = (total ?? 0) + cpu }
+            queue.append(contentsOf: children[next] ?? [])
+        }
+        return total
+    }
+
     func workingDirectory(_ pid: pid_t) -> String? {
         var info = proc_vnodepathinfo()
         let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
@@ -290,6 +334,8 @@ final class Scanner {
     private var codexMetaCache: [String: CodexMeta] = [:]
     private var claudeCWDCache: [String: String] = [:]
     private var previousCPU: [pid_t: Double] = [:]
+    private var trackStates: [String: TrackState] = [:]
+    private var scanCount = 0
     private var cached: Snapshot?
     private var cachedAt = Date.distantPast
 
@@ -323,11 +369,16 @@ final class Scanner {
         // Electron helpers are listed here too, and activating one of those does nothing.
         let appPIDs = Set(runningApps.filter { $0.activationPolicy == .regular }.map(\.processIdentifier))
 
+        var children: [pid_t: [pid_t]] = [:]
+        for entry in processes.values where entry.ppid > 0 {
+            children[entry.ppid, default: []].append(entry.pid)
+        }
+
         var cpuNow: [pid_t: Double] = [:]
         var sessions: [Session] = []
 
         for proc in candidates {
-            let cpu = table.cpuSeconds(proc.pid)
+            let cpu = table.subtreeCPUSeconds(proc.pid, children: children)
             cpuNow[proc.pid] = cpu
             let working: Bool
             if let cpu, let previous = previousCPU[proc.pid] {
@@ -339,6 +390,7 @@ final class Scanner {
             let agent = agentBinaries[proc.name] ?? "Agent"
 
             sessions.append(Session(
+                key: "pid:\(proc.pid)",
                 agent: agent,
                 folder: path.map(shortPath) ?? "unknown folder",
                 path: path,
@@ -367,6 +419,27 @@ final class Scanner {
             if $0.working != $1.working { return $0.working }
             return ($0.agent, $0.folder) < ($1.agent, $1.folder)
         }
+
+        // A session has finished only after it stays quiet for several scans in a row.
+        var states: [String: TrackState] = [:]
+        for session in snapshot.sessions {
+            var state = trackStates[session.key] ?? TrackState()
+            if session.working {
+                state.wasWorking = true
+                state.quietScans = 0
+                state.notified = false
+            } else if state.wasWorking, !state.notified {
+                state.quietScans += 1
+                if state.quietScans >= idleConfirmScans {
+                    state.notified = true
+                    snapshot.wentIdle.append(session)
+                }
+            }
+            states[session.key] = state   // sessions that vanish drop out of tracking
+        }
+        trackStates = states
+        scanCount += 1
+        snapshot.id = scanCount
 
         snapshot.apps = runningApps
             .filter { trackedBundleIDs.contains($0.bundleIdentifier ?? "") }
@@ -451,12 +524,13 @@ final class Scanner {
                 working = !line.contains("\"type\":\"task_complete\"")
             }
             return Session(
+                key: "codex:\(rootID)",
                 agent: "Codex",
                 folder: shortPath(group.cwd),
                 path: group.cwd,
                 tty: nil,
                 subtitle: group.subagents > 0 ? "\(group.subagents) subagent\(group.subagents == 1 ? "" : "s")" : nil,
-                host: .bundle(chatGPTBundleID),
+                host: .codexThread(rootID),
                 working: working,
                 lastActivity: group.latest
             )
@@ -494,6 +568,10 @@ func focus(_ host: HostTarget) {
         } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         }
+    case .codexThread(let threadID):
+        // ChatGPT registers the codex:// scheme and builds these links itself.
+        guard let url = URL(string: "codex://threads/\(threadID)") else { return }
+        NSWorkspace.shared.open(url)
     case .unknown:
         break
     }
@@ -542,18 +620,67 @@ func selectTab(bundleID: String, tty: String) {
     NSAppleScript(source: source)?.executeAndReturnError(&error)
 }
 
+// MARK: - Notifications
+
+let notificationsEnabledKey = "NotifyWhenIdle"
+
+/// Encodes where a session lives so a tapped notification can still focus it.
+func encodeHost(_ host: HostTarget) -> [String: Any] {
+    switch host {
+    case .app(let pid, let tty):
+        var info: [String: Any] = ["kind": "app", "pid": Int(pid)]
+        if let tty { info["tty"] = tty }
+        return info
+    case .bundle(let bundleID): return ["kind": "bundle", "bundle": bundleID]
+    case .codexThread(let id): return ["kind": "codex", "thread": id]
+    case .unknown: return ["kind": "unknown"]
+    }
+}
+
+func decodeHost(_ info: [AnyHashable: Any]) -> HostTarget {
+    switch info["kind"] as? String {
+    case "app":
+        guard let pid = info["pid"] as? Int else { return .unknown }
+        return .app(pid: pid_t(pid), tty: info["tty"] as? String)
+    case "bundle":
+        return (info["bundle"] as? String).map { HostTarget.bundle($0) } ?? .unknown
+    case "codex":
+        return (info["thread"] as? String).map { HostTarget.codexThread($0) } ?? .unknown
+    default:
+        return .unknown
+    }
+}
+
 // MARK: - Menu bar
 
-class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
     var timer: Timer?
+
+    var lastHandledScan = 0
+    var pendingAlerts = 0
+
+    var notificationsEnabled: Bool {
+        get {
+            let defaults = UserDefaults.standard
+            if defaults.object(forKey: notificationsEnabledKey) == nil { return true }
+            return defaults.bool(forKey: notificationsEnabledKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: notificationsEnabledKey) }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem.button?.title = "🧠"
         menu.delegate = self
         statusItem.menu = menu
+
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+
+        if CommandLine.arguments.contains("--notify-test") { runNotificationTest() }
 
         refreshTitle()
         timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
@@ -566,22 +693,124 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func refreshTitle() {
         DispatchQueue.global(qos: .utility).async {
             let snapshot = Scanner.shared.snapshot()
-            DispatchQueue.main.async { self.applyTitle(snapshot) }
+            DispatchQueue.main.async {
+                self.applyTitle(snapshot)
+                self.announce(snapshot)
+            }
+        }
+    }
+
+    /// Snapshots carry an id so a cached one is never announced twice.
+    func announce(_ snapshot: Snapshot) {
+        guard snapshot.id > lastHandledScan else { return }
+        lastHandledScan = snapshot.id
+        guard notificationsEnabled, !snapshot.wentIdle.isEmpty else { return }
+        // The badge is the one signal that cannot be blocked by notification permissions.
+        pendingAlerts += snapshot.wentIdle.count
+        applyTitle(snapshot)
+        for session in snapshot.wentIdle { notify(session) }
+    }
+
+    func notify(_ session: Session) {
+        let host = session.host.describedHost
+        deliver(title: "\(session.agent) · \(session.folder)",
+                body: host.isEmpty ? "Finished, waiting for you" : "Finished in \(host), waiting for you",
+                host: session.host)
+    }
+
+    /// Prefers a real notification, which supports click-to-focus. That needs permission
+    /// this app cannot always get: an ad-hoc signature has no stable identity, so macOS
+    /// may refuse. AppleScript posts a banner without any permission, so it is the fallback.
+    func deliver(title: String, body: String, host: HostTarget) {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let allowed = settings.authorizationStatus == .authorized
+                || settings.authorizationStatus == .provisional
+            guard allowed else {
+                DispatchQueue.main.async { self.deliverViaAppleScript(title: title, body: body) }
+                return
+            }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .default
+            content.userInfo = encodeHost(host)
+            UNUserNotificationCenter.current().add(
+                UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        }
+    }
+
+    func deliverViaAppleScript(title: String, body: String) {
+        func quoted(_ text: String) -> String {
+            "\"" + text.replacingOccurrences(of: "\\", with: "\\\\")
+                       .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        let source = "display notification \(quoted(body)) with title \(quoted(title)) sound name \"Ping\""
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        focus(decodeHost(response.notification.request.content.userInfo))
+        completionHandler()
+    }
+
+    @objc func toggleNotifications(_ sender: NSMenuItem) {
+        notificationsEnabled.toggle()
+    }
+
+    @objc func sendTestNotification(_ sender: NSMenuItem) {
+        deliver(title: "Session Tracker",
+                body: "Test notification. This is what a finished session looks like.",
+                host: .unknown)
+    }
+
+    /// Must run inside a launched app: asking the notification centre anything before
+    /// NSApplication exists fails with "Notifications are not allowed for this application".
+    func runNotificationTest() {
+        let logPath = "/tmp/session-tracker-notify-test.log"
+        try? "".write(toFile: logPath, atomically: true, encoding: .utf8)
+        func report(_ message: String) {
+            print(message)
+            guard let handle = FileHandle(forWritingAtPath: logPath) else { return }
+            handle.seekToEndOfFile()
+            handle.write(Data((message + "\n").utf8))
+            try? handle.close()
+        }
+
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            report("authorization: granted=\(granted) error=\(error?.localizedDescription ?? "none")")
+            center.getNotificationSettings { settings in
+                let allowed = settings.authorizationStatus == .authorized
+                    || settings.authorizationStatus == .provisional
+                report("status=\(settings.authorizationStatus.rawValue) → using \(allowed ? "UserNotifications" : "AppleScript fallback")")
+                DispatchQueue.main.async {
+                    self.deliver(title: "Session Tracker",
+                                 body: "Test notification. If you can read this, alerts work.",
+                                 host: .unknown)
+                    report("posted")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { exit(0) }
+                }
+            }
         }
     }
 
     func applyTitle(_ snapshot: Snapshot) {
         let working = snapshot.sessions.filter(\.working).count
         let total = snapshot.sessions.count
+        let icon = pendingAlerts > 0 ? "🔔" : "🧠"
         if total == 0 {
-            statusItem.button?.title = "🧠"
+            statusItem.button?.title = icon
         } else {
-            statusItem.button?.title = working > 0 ? "🧠 \(working)/\(total)" : "🧠 \(total)"
+            statusItem.button?.title = working > 0 ? "\(icon) \(working)/\(total)" : "\(icon) \(total)"
         }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         let snapshot = Scanner.shared.snapshot(maxAge: 2)
+        pendingAlerts = 0   // opening the menu is how you acknowledge the badge
         menu.removeAllItems()
 
         menu.addItem(header("Active coding sessions"))
@@ -618,8 +847,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let toggle = NSMenuItem(title: "Notify when a session finishes",
+                                action: #selector(toggleNotifications(_:)), keyEquivalent: "")
+        toggle.target = self
+        toggle.state = notificationsEnabled ? .on : .off
+        menu.addItem(toggle)
+
+        let test = NSMenuItem(title: "Send test notification",
+                              action: #selector(sendTestNotification(_:)), keyEquivalent: "")
+        test.target = self
+        menu.addItem(test)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
         applyTitle(snapshot)
+        announce(snapshot)
     }
 
     func header(_ text: String) -> NSMenuItem {
@@ -689,15 +930,9 @@ if CommandLine.arguments.contains("--list") {
     print("Sessions (\(snapshot.sessions.count))")
     for session in snapshot.sessions {
         let subtitle = session.subtitle.map { " · \($0)" } ?? ""
-        let host: String
-        switch session.host {
-        case .app(let pid, let tty):
-            let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
-            host = tty.map { "\(name) [\($0)]" } ?? name
-        case .bundle(let id): host = id
-        case .unknown: host = "unknown"
-        }
-        print("  \(session.dot) \(session.agent) · \(session.folder)\(subtitle)  [\(session.statusText)]  focus→ \(host)")
+        var host = session.host.describedHost
+        if case .codexThread(let id) = session.host { host += " thread \(id)" }
+        print("  \(session.dot) \(session.agent) · \(session.folder)\(subtitle)  [\(session.statusText)]  focus→ \(host.isEmpty ? "unknown" : host)")
         print("      \(session.path ?? "-")")
     }
     print("Apps (\(snapshot.apps.count))")
