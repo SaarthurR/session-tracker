@@ -21,6 +21,14 @@ let backgroundSubcommands: Set<String> = [
     "serve", "daemon", "update", "doctor", "completion",
 ]
 
+/// `cursor-agent … worker start` is the single helper Cursor keeps running for all of its
+/// own chats, so it is neither one session nor idle when its chats are busy. Those chats
+/// are picked up from their transcripts instead.
+func isBackgroundWorker(_ args: [String]) -> Bool {
+    guard let index = args.firstIndex(of: "worker"), index + 1 < args.count else { return false }
+    return args[index + 1] == "start"
+}
+
 let trackedBundleIDs: Set<String> = [
     "com.todesktop.230313mzl4w4u92",  // Cursor
     "com.anthropic.claudefordesktop", // Claude
@@ -41,6 +49,12 @@ let codexSessionWindow: TimeInterval = 30 * 60
 /// Re-reading the tail of a transcript is only worth it while it is still changing.
 let codexTailWindow: TimeInterval = 120
 let claudeTranscriptWindow: TimeInterval = 24 * 60 * 60
+/// A finished Cursor chat stays listed this long, matching Codex.
+let cursorSessionWindow: TimeInterval = 30 * 60
+/// Cursor writes to a transcript only at the edges of a turn, so a chat grinding through
+/// a long turn looks untouched. Mid-turn chats stay listed this long before being read
+/// as abandoned rather than busy.
+let cursorMidTurnWindow: TimeInterval = 4 * 60 * 60
 /// Below this, a session is shown as recently active rather than idle.
 let recentlyActiveWindow: TimeInterval = 15 * 60
 
@@ -51,6 +65,8 @@ enum HostTarget {
     case bundle(String)
     /// ChatGPT can open a specific conversation, which is the only way to tell two apart.
     case codexThread(String)
+    /// Cursor has no link to a single chat, but reopening the folder raises its window.
+    case cursorWorkspace(String?)
     case unknown
 
     var describedHost: String {
@@ -62,6 +78,7 @@ enum HostTarget {
             return NSWorkspace.shared.runningApplications
                 .first { $0.bundleIdentifier == bundleID }?.localizedName ?? bundleID
         case .codexThread: return "ChatGPT"
+        case .cursorWorkspace: return "Cursor"
         case .unknown: return ""
         }
     }
@@ -169,6 +186,31 @@ func lastLine(ofFile path: String, chunk: Int = 8192) -> String? {
     guard let data = try? handle.readToEnd(),
           let text = String(data: data, encoding: .utf8) else { return nil }
     return text.split(separator: "\n").last.map(String.init)
+}
+
+/// Cursor names a project directory after its workspace path with the slashes turned into
+/// dashes, so `/Users/me/Documents/frizzle/frizzle-fun` and a folder literally called
+/// `frizzle-frizzle-fun` encode the same way. The only way back is to try each split
+/// against the filesystem, longest run first. Windows with no folder open are named after
+/// a timestamp instead and resolve to nothing.
+func decodeWorkspace(_ encoded: String) -> String? {
+    func walk(_ tokens: ArraySlice<String>, under base: String) -> String? {
+        var end = tokens.endIndex
+        while end > tokens.startIndex {
+            let candidate = base + "/" + tokens[tokens.startIndex..<end].joined(separator: "-")
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: candidate, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                if end == tokens.endIndex { return candidate }
+                if let resolved = walk(tokens[end...], under: candidate) { return resolved }
+            }
+            end -= 1
+        }
+        return nil
+    }
+    let tokens = encoded.split(separator: "-").map(String.init)
+    guard !tokens.isEmpty else { return nil }
+    return walk(tokens[...], under: "")
 }
 
 func firstMatch(_ pattern: String, in text: String) -> String? {
@@ -333,6 +375,8 @@ final class Scanner {
     private let table = ProcessTable()
     private var codexMetaCache: [String: CodexMeta] = [:]
     private var claudeCWDCache: [String: String] = [:]
+    private var cursorWorkspaceCache: [String: String?] = [:]
+    private var turnEndedCache: [String: (modified: Date, ended: Bool)] = [:]
     private var previousCPU: [pid_t: Double] = [:]
     private var trackStates: [String: TrackState] = [:]
     private var scanCount = 0
@@ -358,6 +402,7 @@ final class Scanner {
         candidates = candidates.filter { proc in
             let args = table.arguments(proc.pid, all: true)
             guard args.count > 1 else { return true }
+            guard !isBackgroundWorker(args) else { return false }
             return !backgroundSubcommands.contains(args[1]) && !args[1].hasPrefix("--listen")
         }
         // A session spawned by another session is one session, not two.
@@ -403,6 +448,9 @@ final class Scanner {
             ))
         }
 
+        // A cursor-agent in a terminal writes a transcript too, so its folder is spoken for.
+        let claimed = Set(sessions.filter { $0.agent == "Cursor Agent" }.compactMap(\.path))
+        sessions.append(contentsOf: phase("cursor transcripts") { cursorSessions(excluding: claimed) })
         sessions.append(contentsOf: phase("codex transcripts") { codexDesktopSessions() })
         previousCPU = cpuNow
 
@@ -489,6 +537,61 @@ final class Scanner {
         return unescaped
     }
 
+    // MARK: Cursor chats
+
+    /// Cursor runs its chats inside the app rather than as one process each, so there is
+    /// nothing to find in the process table: a busy chat and an idle one look identical
+    /// from outside. Each chat does keep a transcript, and a turn closes it with a
+    /// turn_ended line, which is a far better signal than CPU ever was.
+    private func cursorSessions(excluding claimed: Set<String>) -> [Session] {
+        let root = NSHomeDirectory() + "/.cursor/projects"
+        let cutoff = Date().addingTimeInterval(-cursorMidTurnWindow)
+        guard let projects = try? FileManager.default.contentsOfDirectory(atPath: root) else { return [] }
+
+        var sessions: [Session] = []
+        for project in projects {
+            let workspace = cursorWorkspace(project)
+            if let workspace, claimed.contains(workspace) { continue }
+
+            for file in recentTranscripts(in: root + "/" + project + "/agent-transcripts",
+                                          newerThan: cutoff) {
+                let working = !turnEnded(file.path, modified: file.modified)
+                // Only a chat still mid-turn earns the longer window.
+                guard working || Date().timeIntervalSince(file.modified) < cursorSessionWindow
+                    else { continue }
+
+                sessions.append(Session(
+                    key: "cursor:" + (file.path as NSString).lastPathComponent,
+                    agent: "Cursor Agent",
+                    folder: workspace.map(shortPath) ?? "no folder",
+                    path: workspace,
+                    tty: nil,
+                    subtitle: nil,
+                    host: .cursorWorkspace(workspace),
+                    working: working,
+                    lastActivity: file.modified
+                ))
+            }
+        }
+        return sessions
+    }
+
+    /// The tail only needs re-reading once the file has grown.
+    private func turnEnded(_ path: String, modified: Date) -> Bool {
+        if let cached = turnEndedCache[path], cached.modified == modified { return cached.ended }
+        let ended = lastLine(ofFile: path)?.contains("\"type\":\"turn_ended\"") ?? false
+        turnEndedCache[path] = (modified, ended)
+        return ended
+    }
+
+    /// Walking the filesystem to decode a name is not free, but a workspace never moves.
+    private func cursorWorkspace(_ encoded: String) -> String? {
+        if let cached = cursorWorkspaceCache[encoded] { return cached }
+        let resolved = decodeWorkspace(encoded)
+        cursorWorkspaceCache[encoded] = resolved
+        return resolved
+    }
+
     // MARK: Codex Desktop threads
 
     /// Codex threads run inside ChatGPT.app, so no process exists to find them by.
@@ -572,6 +675,17 @@ func focus(_ host: HostTarget) {
         // ChatGPT registers the codex:// scheme and builds these links itself.
         guard let url = URL(string: "codex://threads/\(threadID)") else { return }
         NSWorkspace.shared.open(url)
+    case .cursorWorkspace(let path):
+        // Reopening a folder Cursor already has open raises that window instead of adding one.
+        guard let path, let cursor = NSWorkspace.shared
+            .urlForApplication(withBundleIdentifier: cursorBundleID) else {
+            focus(.bundle(cursorBundleID))
+            return
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open([URL(fileURLWithPath: path)],
+                                withApplicationAt: cursor, configuration: configuration)
     case .unknown:
         break
     }
@@ -633,6 +747,10 @@ func encodeHost(_ host: HostTarget) -> [String: Any] {
         return info
     case .bundle(let bundleID): return ["kind": "bundle", "bundle": bundleID]
     case .codexThread(let id): return ["kind": "codex", "thread": id]
+    case .cursorWorkspace(let path):
+        var info: [String: Any] = ["kind": "cursor"]
+        if let path { info["path"] = path }
+        return info
     case .unknown: return ["kind": "unknown"]
     }
 }
@@ -646,6 +764,8 @@ func decodeHost(_ info: [AnyHashable: Any]) -> HostTarget {
         return (info["bundle"] as? String).map { HostTarget.bundle($0) } ?? .unknown
     case "codex":
         return (info["thread"] as? String).map { HostTarget.codexThread($0) } ?? .unknown
+    case "cursor":
+        return .cursorWorkspace(info["path"] as? String)
     default:
         return .unknown
     }

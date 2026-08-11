@@ -79,8 +79,20 @@ present themselves the obvious way:
   by reading `~/.codex/sessions/**/rollout-*.jsonl` instead. Threads are grouped by their
   root `session_id`, so a swarm shows as one session with a subagent count rather than
   fifteen rows.
+- **Cursor chats have no process either.** Cursor keeps exactly one `cursor-agent … worker
+  start` helper for all of its chats, so that process is neither one session nor busy when
+  the chats are. It is filtered out, and chats are read from their transcripts in
+  `~/.cursor/projects/<workspace>/agent-transcripts/` instead. A `cursor-agent` you started
+  yourself in a terminal is still tracked as a process, and takes precedence over the
+  transcript for the same folder.
 - **Background helpers are not sessions.** `jcode menubar` and `jcode setup-hotkey` are
   filtered out by subcommand, and a session spawned by another session is counted once.
+
+Cursor names those project directories after the workspace path with the slashes turned into
+dashes, which is ambiguous the moment a folder contains a dash: `frizzle-frizzle-fun` is
+either `frizzle/frizzle-fun` or a folder of that name. Each possible split is tried against
+the filesystem, longest run first. Windows with no folder open are named after a timestamp
+and are listed as "no folder".
 
 ## Working vs idle
 
@@ -91,6 +103,14 @@ A live process is not a busy one. Activity is measured two ways:
   also burns none while its child does the work, which would otherwise read as idle.
 - **Codex threads:** the last event in the transcript. A finished turn ends with
   `task_complete`; anything else means it is mid-turn.
+- **Cursor chats:** the same idea, ending on `turn_ended`. CPU is useless here even when a
+  `cursor-agent` process exists, because the work happens on Cursor's servers and the local
+  process barely stirs: 0.01 CPU seconds over 5 seconds while actively running a task.
+
+Cursor only writes to a transcript at the edges of a turn, so a chat working through a long
+one leaves the file untouched for minutes. Freshness therefore cannot decide busy, only the
+`turn_ended` line can, and a mid-turn chat stays listed for up to 4 hours rather than the 30
+minutes a finished one gets.
 
 Idle time for Claude Code comes from the newest transcript in `~/.claude/projects` matching
 that working directory. Sessions go 🟢 working → 🟡 idle under 15 minutes → ⚪️ idle longer.
@@ -102,8 +122,10 @@ real GUI app, which is the terminal it was launched from. That app is activated,
 Terminal and iTerm2 an AppleScript then selects the specific tab matching the session's tty.
 
 Tab selection needs Automation permission, requested once on first click. If it is denied,
-the terminal still comes to the front, just not the specific tab. Sessions with no parent
-terminal, like `cursor-agent`, fall back to activating Cursor.
+the terminal still comes to the front, just not the specific tab.
+
+Cursor chats have no terminal and no per-chat link, so they reopen their workspace folder in
+Cursor, which raises the window already showing it instead of adding another.
 
 Codex threads have no terminal, and activating ChatGPT is not enough when several
 conversations are open. They open through `codex://threads/<id>`, the URL scheme ChatGPT
@@ -132,8 +154,10 @@ and clears when you open the menu. That signal cannot be blocked by permissions.
 ## Cost
 
 The scan avoids subprocesses entirely: `ps` and `lsof` cost ~300ms per scan in startup
-overhead alone, against ~25ms for the equivalent `libproc` and `sysctl` calls. At a 5 second
-refresh that is under 1% of one core.
+overhead alone, against ~25ms for the equivalent `libproc` and `sysctl` calls. Reading
+transcripts costs about as much again, since finding the recent ones means stating every
+file in the tree. A scan lands around 60ms on a background thread, so at a 5 second refresh
+it stays near 1% of one core.
 
 ```bash
 ./build.sh && ST_PROFILE=1 ~/Applications/SessionTracker.app/Contents/MacOS/SessionTracker --list
