@@ -124,8 +124,12 @@ Terminal and iTerm2 an AppleScript then selects the specific tab matching the se
 Tab selection needs Automation permission, requested once on first click. If it is denied,
 the terminal still comes to the front, just not the specific tab.
 
-Cursor chats have no terminal and no per-chat link, so they reopen their workspace folder in
-Cursor, which raises the window already showing it instead of adding another.
+Cursor chats have no terminal, and opening their workspace folder is wrong twice over: it
+lands in the editor rather than the Agents window where the chats actually are, and it
+prompts before opening a folder that is usually already open. They go through
+`cursor://anysphere.cursor-deeplink/agent` instead, the route Cursor's own deeplink
+extension maps to "open or focus the Agents window". There is no route for a single chat,
+so it opens the window rather than the conversation you clicked.
 
 Codex threads have no terminal, and activating ChatGPT is not enough when several
 conversations are open. They open through `codex://threads/<id>`, the URL scheme ChatGPT

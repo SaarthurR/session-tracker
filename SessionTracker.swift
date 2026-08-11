@@ -65,8 +65,8 @@ enum HostTarget {
     case bundle(String)
     /// ChatGPT can open a specific conversation, which is the only way to tell two apart.
     case codexThread(String)
-    /// Cursor has no link to a single chat, but reopening the folder raises its window.
-    case cursorWorkspace(String?)
+    /// Cursor chats live in their own window rather than in the editor.
+    case cursorAgents
     case unknown
 
     var describedHost: String {
@@ -78,7 +78,7 @@ enum HostTarget {
             return NSWorkspace.shared.runningApplications
                 .first { $0.bundleIdentifier == bundleID }?.localizedName ?? bundleID
         case .codexThread: return "ChatGPT"
-        case .cursorWorkspace: return "Cursor"
+        case .cursorAgents: return "Cursor Agents"
         case .unknown: return ""
         }
     }
@@ -567,7 +567,7 @@ final class Scanner {
                     path: workspace,
                     tty: nil,
                     subtitle: nil,
-                    host: .cursorWorkspace(workspace),
+                    host: .cursorAgents,
                     working: working,
                     lastActivity: file.modified
                 ))
@@ -675,17 +675,14 @@ func focus(_ host: HostTarget) {
         // ChatGPT registers the codex:// scheme and builds these links itself.
         guard let url = URL(string: "codex://threads/\(threadID)") else { return }
         NSWorkspace.shared.open(url)
-    case .cursorWorkspace(let path):
-        // Reopening a folder Cursor already has open raises that window instead of adding one.
-        guard let path, let cursor = NSWorkspace.shared
-            .urlForApplication(withBundleIdentifier: cursorBundleID) else {
+    case .cursorAgents:
+        // Cursor has no link to a single chat, so this opens the window they all live in.
+        // Opening the workspace folder instead would land in the editor and prompt first.
+        guard let url = URL(string: "cursor://anysphere.cursor-deeplink/agent"),
+              NSWorkspace.shared.open(url) else {
             focus(.bundle(cursorBundleID))
             return
         }
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        NSWorkspace.shared.open([URL(fileURLWithPath: path)],
-                                withApplicationAt: cursor, configuration: configuration)
     case .unknown:
         break
     }
@@ -747,10 +744,7 @@ func encodeHost(_ host: HostTarget) -> [String: Any] {
         return info
     case .bundle(let bundleID): return ["kind": "bundle", "bundle": bundleID]
     case .codexThread(let id): return ["kind": "codex", "thread": id]
-    case .cursorWorkspace(let path):
-        var info: [String: Any] = ["kind": "cursor"]
-        if let path { info["path"] = path }
-        return info
+    case .cursorAgents: return ["kind": "cursor"]
     case .unknown: return ["kind": "unknown"]
     }
 }
@@ -765,7 +759,7 @@ func decodeHost(_ info: [AnyHashable: Any]) -> HostTarget {
     case "codex":
         return (info["thread"] as? String).map { HostTarget.codexThread($0) } ?? .unknown
     case "cursor":
-        return .cursorWorkspace(info["path"] as? String)
+        return .cursorAgents
     default:
         return .unknown
     }
