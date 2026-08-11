@@ -10,9 +10,9 @@ its folder in Finder.
 🧠 2/5
 ─────────────────────────────
 Active coding sessions
-🟢  Codex · juber · 9 subagents      working
-🟡  Claude Code · saarth^2 · ttys000  idle 6m
-⚪️  Cursor Agent · frizzle           idle 2h
+🟢  Codex · api-server · 9 subagents   working
+🟡  Claude Code · web-app · ttys000    idle 6m
+⚪️  Cursor Agent · dashboard          idle 2h
 ─────────────────────────────
 Apps open
   ChatGPT
@@ -26,17 +26,37 @@ Apps open
 
 The title shows `working/total` when something is running, otherwise just the session count.
 
+Recognises Claude Code, Codex (both the CLI and threads inside the ChatGPT desktop app),
+Cursor Agent, Gemini, Aider, opencode, and jcode. Adding another takes one line.
+
 ## Install
 
+Requires macOS 13 or later and the Xcode Command Line Tools. If you do not have them:
+
 ```bash
-./build.sh                # builds and installs to ~/Applications
+xcode-select --install
+```
+
+Then:
+
+```bash
+git clone https://github.com/SaarthurR/session-tracker.git
+cd session-tracker
+./build.sh
 open ~/Applications/SessionTracker.app
 ```
 
-Pass a different directory to install elsewhere: `./build.sh /Applications`.
+`build.sh` compiles the single Swift file into `SessionTracker.app` and installs it to
+`~/Applications`. Pass a directory to install elsewhere: `./build.sh /Applications`.
 
-Requires the Xcode Command Line Tools (`xcode-select --install`). No Xcode project, no
-dependencies, one Swift file.
+There is no Xcode project and no dependencies. A 🧠 appears in the menu bar; the app has no
+dock icon and no window.
+
+Two permissions may be requested, both optional and both only on first use. Focusing a
+specific terminal tab asks for Automation, and declining still brings the terminal to the
+front. Notifications are covered below.
+
+To uninstall, quit from the menu and delete `~/Applications/SessionTracker.app`.
 
 ### Start at login
 
