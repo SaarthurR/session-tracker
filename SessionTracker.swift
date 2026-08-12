@@ -49,6 +49,9 @@ let codexSessionWindow: TimeInterval = 30 * 60
 /// Re-reading the tail of a transcript is only worth it while it is still changing.
 let codexTailWindow: TimeInterval = 120
 let claudeTranscriptWindow: TimeInterval = 24 * 60 * 60
+/// Claude records every step it takes, so a turn that is still open after this long is
+/// waiting on a person, most likely to approve a tool, rather than working.
+let claudeMidTurnWindow: TimeInterval = 10 * 60
 /// A finished Cursor chat stays listed this long, matching Codex.
 let cursorSessionWindow: TimeInterval = 30 * 60
 /// Cursor writes to a transcript only at the edges of a turn, so a chat grinding through
@@ -158,34 +161,41 @@ func shortPath(_ path: String) -> String {
 
 /// One pass over a transcript tree with modification dates prefetched, which matters
 /// because these directories hold hundreds of files and this runs every few seconds.
-func recentTranscripts(in root: String, newerThan cutoff: Date) -> [(path: String, modified: Date)] {
+func recentTranscripts(in root: String, newerThan cutoff: Date)
+    -> [(path: String, modified: Date, created: Date)] {
+    let keys: [URLResourceKey] = [.contentModificationDateKey, .creationDateKey, .isRegularFileKey]
     guard FileManager.default.fileExists(atPath: root),
           let enumerator = FileManager.default.enumerator(
             at: URL(fileURLWithPath: root),
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            includingPropertiesForKeys: keys,
             options: [.skipsHiddenFiles]) else { return [] }
 
-    var result: [(path: String, modified: Date)] = []
+    var result: [(path: String, modified: Date, created: Date)] = []
     for case let url as URL in enumerator {
         guard url.pathExtension == "jsonl",
-              let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+              let values = try? url.resourceValues(forKeys: Set(keys)),
               values.isRegularFile == true,
               let modified = values.contentModificationDate,
               modified > cutoff else { continue }
-        result.append((url.path, modified))
+        result.append((url.path, modified, values.creationDate ?? modified))
     }
     return result
 }
 
-/// Reads the tail of an append-only transcript.
-func lastLine(ofFile path: String, chunk: Int = 8192) -> String? {
+/// Reads the tail of an append-only transcript, returning the last line of interest.
+/// The line the tail opens on is dropped unless the whole file was read, because it is
+/// only the end of whatever line the chunk landed in the middle of.
+func lastLine(ofFile path: String, chunk: Int = 8192,
+              matching isInteresting: (String) -> Bool = { _ in true }) -> String? {
     guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
     defer { try? handle.close() }
     guard let end = try? handle.seekToEnd() else { return nil }
-    try? handle.seek(toOffset: end > UInt64(chunk) ? end - UInt64(chunk) : 0)
+    let truncated = end > UInt64(chunk)
+    try? handle.seek(toOffset: truncated ? end - UInt64(chunk) : 0)
     guard let data = try? handle.readToEnd(),
           let text = String(data: data, encoding: .utf8) else { return nil }
-    return text.split(separator: "\n").last.map(String.init)
+    let lines = text.split(separator: "\n")
+    return lines.dropFirst(truncated ? 1 : 0).last(where: { isInteresting(String($0)) }).map(String.init)
 }
 
 /// Cursor names a project directory after its workspace path with the slashes turned into
@@ -227,6 +237,7 @@ struct ProcEntry {
     let pid: pid_t
     let ppid: pid_t
     let tdev: dev_t
+    let started: Date
 }
 
 struct ProcInfo {
@@ -234,6 +245,7 @@ struct ProcInfo {
     let ppid: pid_t
     let tty: String?
     let argv0: String
+    let started: Date
     var name: String { (argv0 as NSString).lastPathComponent }
 }
 
@@ -267,7 +279,12 @@ final class ProcessTable {
             let proc = procs[index]
             let pid = proc.kp_proc.p_pid
             guard pid > 0 else { continue }
-            table[pid] = ProcEntry(pid: pid, ppid: proc.kp_eproc.e_ppid, tdev: proc.kp_eproc.e_tdev)
+            let started = proc.kp_proc.p_un.__p_starttime
+            table[pid] = ProcEntry(
+                pid: pid,
+                ppid: proc.kp_eproc.e_ppid,
+                tdev: proc.kp_eproc.e_tdev,
+                started: Date(timeIntervalSince1970: Double(started.tv_sec) + Double(started.tv_usec) / 1e6))
         }
         return table
     }
@@ -355,7 +372,8 @@ final class ProcessTable {
         table.values.compactMap { entry in
             guard let argv0 = arguments(entry.pid).first, !argv0.contains(".app/"),
                   agentBinaries[(argv0 as NSString).lastPathComponent] != nil else { return nil }
-            return ProcInfo(pid: entry.pid, ppid: entry.ppid, tty: ttyName(entry.tdev), argv0: argv0)
+            return ProcInfo(pid: entry.pid, ppid: entry.ppid, tty: ttyName(entry.tdev),
+                            argv0: argv0, started: entry.started)
         }
     }
 }
@@ -368,6 +386,13 @@ struct CodexMeta {
     let isSubagent: Bool
 }
 
+struct ClaudeActivity {
+    let modified: Date
+    let created: Date
+    /// Nil when the transcript could not be read, which leaves CPU to decide.
+    let midTurn: Bool?
+}
+
 final class Scanner {
     static let shared = Scanner()
 
@@ -377,6 +402,7 @@ final class Scanner {
     private var claudeCWDCache: [String: String] = [:]
     private var cursorWorkspaceCache: [String: String?] = [:]
     private var turnEndedCache: [String: (modified: Date, ended: Bool)] = [:]
+    private var midTurnCache: [String: (modified: Date, midTurn: Bool?)] = [:]
     private var previousCPU: [pid_t: Double] = [:]
     private var trackStates: [String: TrackState] = [:]
     private var scanCount = 0
@@ -422,17 +448,27 @@ final class Scanner {
         var cpuNow: [pid_t: Double] = [:]
         var sessions: [Session] = []
 
+        var paths: [pid_t: String] = [:]
+        for proc in candidates { paths[proc.pid] = table.workingDirectory(proc.pid) }
+        let claudeMatches = matchClaude(candidates.filter { agentBinaries[$0.name] == "Claude Code" },
+                                        to: claudeActivity, paths: paths)
+
         for proc in candidates {
             let cpu = table.subtreeCPUSeconds(proc.pid, children: children)
             cpuNow[proc.pid] = cpu
+            let path = paths[proc.pid]
+            let agent = agentBinaries[proc.name] ?? "Agent"
+            let activity = claudeMatches[proc.pid]
+
             let working: Bool
-            if let cpu, let previous = previousCPU[proc.pid] {
+            if let activity, let midTurn = activity.midTurn {
+                // Claude reports its own state, and reports it better than CPU can guess it.
+                working = midTurn && Date().timeIntervalSince(activity.modified) < claudeMidTurnWindow
+            } else if let cpu, let previous = previousCPU[proc.pid] {
                 working = cpu - previous > workingCPUThreshold
             } else {
                 working = false
             }
-            let path = table.workingDirectory(proc.pid)
-            let agent = agentBinaries[proc.name] ?? "Agent"
 
             sessions.append(Session(
                 key: "pid:\(proc.pid)",
@@ -443,8 +479,7 @@ final class Scanner {
                 subtitle: nil,
                 host: hostTarget(for: proc, processes: processes, appPIDs: appPIDs),
                 working: working,
-                // Only Claude Code writes a transcript we can date; the rest fall back to CPU.
-                lastActivity: agent == "Claude Code" ? path.flatMap { claudeActivity[$0] } : nil
+                lastActivity: activity?.modified
             ))
         }
 
@@ -513,15 +548,62 @@ final class Scanner {
 
     // MARK: Claude transcripts
 
-    private func claudeActivityByCWD() -> [String: Date] {
-        var activity: [String: Date] = [:]
+    /// Transcripts per working directory, most recently written first.
+    private func claudeActivityByCWD() -> [String: [ClaudeActivity]] {
+        var byCWD: [String: [(path: String, modified: Date, created: Date)]] = [:]
         let cutoff = Date().addingTimeInterval(-claudeTranscriptWindow)
         for file in recentTranscripts(in: NSHomeDirectory() + "/.claude/projects", newerThan: cutoff) {
             guard let cwd = claudeCWD(file.path) else { continue }
-            if let existing = activity[cwd], existing > file.modified { continue }
-            activity[cwd] = file.modified
+            byCWD[cwd, default: []].append(file)
         }
-        return activity
+        return byCWD.mapValues { files in
+            files.sorted { $0.modified > $1.modified }.map {
+                ClaudeActivity(modified: $0.modified, created: $0.created,
+                               midTurn: claudeMidTurn($0.path, modified: $0.modified))
+            }
+        }
+    }
+
+    /// Nothing in a transcript names the process that writes it, so sessions sharing a
+    /// folder are matched to the transcript created closest to when they started, closest
+    /// pairing first. A session that resumed an old conversation still finds it, because
+    /// every remaining pairing is a worse fit than the one it wants.
+    private func matchClaude(_ processes: [ProcInfo],
+                             to transcripts: [String: [ClaudeActivity]],
+                             paths: [pid_t: String]) -> [pid_t: ClaudeActivity] {
+        var matches: [pid_t: ClaudeActivity] = [:]
+        for (cwd, group) in Dictionary(grouping: processes, by: { paths[$0.pid] ?? "" }) {
+            // Only the transcripts written most recently can belong to a live session.
+            let candidates = Array((transcripts[cwd] ?? []).prefix(group.count))
+            var gaps: [(gap: TimeInterval, pid: pid_t, index: Int)] = []
+            for proc in group {
+                for (index, transcript) in candidates.enumerated() {
+                    gaps.append((abs(transcript.created.timeIntervalSince(proc.started)), proc.pid, index))
+                }
+            }
+            var taken = Set<Int>()
+            for pairing in gaps.sorted(by: { $0.gap < $1.gap }) {
+                guard matches[pairing.pid] == nil, taken.insert(pairing.index).inserted else { continue }
+                matches[pairing.pid] = candidates[pairing.index]
+            }
+        }
+        return matches
+    }
+
+    /// A turn is over once the last message in the transcript is a reply that stopped on
+    /// its own terms. One that stopped to call a tool, or a message on the way in, means a
+    /// turn is still in flight however quiet the process looks. Everything in between is
+    /// metadata that Claude writes during a turn as well as after one, so it is skipped
+    /// rather than read as progress.
+    private func claudeMidTurn(_ path: String, modified: Date) -> Bool? {
+        if let cached = midTurnCache[path], cached.modified == modified { return cached.midTurn }
+        // Single lines run past 60KB, so the tail has to be generous to hold a message.
+        let line = lastLine(ofFile: path, chunk: 256 * 1024) {
+            $0.contains("\"type\":\"assistant\"") || $0.contains("\"type\":\"user\"")
+        }
+        let midTurn = line.map { $0.contains("\"type\":\"user\"") || $0.contains("\"stop_reason\":\"tool_use\"") }
+        midTurnCache[path] = (modified, midTurn)
+        return midTurn
     }
 
     /// The cwd sits a few lines into the transcript and never changes, so cache it per file.

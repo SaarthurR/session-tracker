@@ -96,24 +96,35 @@ and are listed as "no folder".
 
 ## Working vs idle
 
-A live process is not a busy one. Activity is measured two ways:
+A live process is not a busy one, and CPU is a poor way to tell them apart: an agent spends
+a turn waiting on a server, not on your machine. A `cursor-agent` running a task burns 0.01
+CPU seconds over 5 seconds, which is indistinguishable from one sitting at a prompt. So
+every agent that keeps a transcript is read instead, and CPU is only the fallback for the
+ones that do not:
 
-- **Processes:** CPU time consumed between two scans, summed across the whole process
-  subtree. An agent waiting for you burns none, but an agent that shelled out to a build
-  also burns none while its child does the work, which would otherwise read as idle.
-- **Codex threads:** the last event in the transcript. A finished turn ends with
-  `task_complete`; anything else means it is mid-turn.
-- **Cursor chats:** the same idea, ending on `turn_ended`. CPU is useless here even when a
-  `cursor-agent` process exists, because the work happens on Cursor's servers and the local
-  process barely stirs: 0.01 CPU seconds over 5 seconds while actively running a task.
+- **Claude Code:** the last message in the transcript. A reply that stopped to call a tool,
+  or a message on the way in, means a turn is in flight; a reply that stopped on its own
+  terms means the turn is over. Claude also writes metadata lines during a turn as well as
+  after one, so those are skipped rather than read as progress.
+- **Codex threads:** a finished turn ends with `task_complete`.
+- **Cursor chats:** a finished turn ends with `turn_ended`.
+- **Everything else:** CPU time consumed between two scans, summed across the whole process
+  subtree. An agent that shelled out to a build burns none itself while its child does the
+  work, which would otherwise read as idle.
 
-Cursor only writes to a transcript at the edges of a turn, so a chat working through a long
-one leaves the file untouched for minutes. Freshness therefore cannot decide busy, only the
-`turn_ended` line can, and a mid-turn chat stays listed for up to 4 hours rather than the 30
-minutes a finished one gets.
+Freshness cannot stand in for any of this. Claude writes a line per step, but Cursor only
+writes at the edges of a turn, so a chat grinding through a long one leaves its file
+untouched for minutes. Only the marker decides. Staleness is used just as a safety valve
+for a turn that will never close, because the session was killed or is sat waiting on a
+permission prompt: 10 minutes for Claude, which narrates constantly, and 4 hours for Cursor,
+which does not.
 
-Idle time for Claude Code comes from the newest transcript in `~/.claude/projects` matching
-that working directory. Sessions go 🟢 working → 🟡 idle under 15 minutes → ⚪️ idle longer.
+Sessions go 🟢 working → 🟡 idle under 15 minutes → ⚪️ idle longer.
+
+Nothing in a Claude transcript names the process that writes it, so two sessions in the same
+folder cannot be told apart by content. Each is matched to the transcript created closest to
+when the process started, closest pairing first. That also handles a session that resumed a
+two-day-old conversation, which pairs with its original file rather than the newest one.
 
 ## Clicking a session
 
@@ -138,9 +149,9 @@ registers and uses for its own "copy link" feature. For a top-level thread the i
 
 ## Notifications
 
-When a session that was working goes quiet, it sends a notification so you can go check on
-it. Quiet means several consecutive scans with no CPU, not a single one, so a pause between
-turns does not fire it. Toggle it from the menu; "Send test notification" checks delivery.
+When a session that was working stops, it sends a notification so you can go check on it.
+Stopped has to hold for several consecutive scans, not one, so a pause inside a turn does
+not fire it. Toggle it from the menu; "Send test notification" checks delivery.
 
 Delivery has a wrinkle. `UserNotifications` is preferred because a notification can then be
 clicked to focus the session that sent it, but it needs a permission macOS refuses to grant
